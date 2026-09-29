@@ -1,17 +1,55 @@
 # main.py — TicketCode / Barcode Wallet — passo 2: Gerador (PoC parque)
+import os
+import platform
+import traceback
+
 from kivy.app import App
 from kivy.lang import Builder
 from kivy.uix.screenmanager import ScreenManager, Screen
+from kivy.uix.label import Label
 from kivy.core.window import Window
 from kivy.graphics.texture import Texture
 from kivy.clock import Clock
 from kivy.metrics import dp
+from kivy.base import ExceptionHandler, ExceptionManager
 
 from barcodegen import SYMBOLOGIES, time_code, render
 
-# durante o dev no PC, simular proporção de telemóvel em landscape
-Window.size = (740, 360)
+ANDROID = 'ANDROID_ARGUMENT' in os.environ  # True quando corre no telemóvel
+
+# no PC simular proporção de telemóvel; no Android deixar em fullscreen nativo
+if not ANDROID:
+    Window.size = (740, 360)
 Window.clearcolor = (0, 0, 0, 1)   # fundo preto
+
+
+# --- rede de segurança: em vez de crash silencioso, mostra o traceback ---
+class _CrashHandler(ExceptionHandler):
+    def handle_exception(self, inst):
+        tb = traceback.format_exc()
+        # gravar num ficheiro acessível
+        for path in ('/sdcard/barcodetoolkit_crash.txt',
+                     os.path.join(os.path.expanduser('~'), 'btk_crash.txt')):
+            try:
+                with open(path, 'w') as f:
+                    f.write(tb)
+                break
+            except Exception:
+                continue
+        # mostrar no ecrã
+        try:
+            app = App.get_running_app()
+            if app and app.root is not None:
+                app.root.clear_widgets()
+                app.root.add_widget(Label(
+                    text=tb[-3500:], color=(1, 1, 1, 1),
+                    font_size='11sp', halign='left', valign='top'))
+        except Exception:
+            pass
+        return ExceptionManager.PASS
+
+
+ExceptionManager.add_handler(_CrashHandler())
 
 KV = """
 #:set FG (0.88, 0.88, 0.88, 1)
@@ -140,7 +178,6 @@ KV = """
         Label:
             id: info
             color: FG
-            font_name: 'RobotoMono-Regular'
             font_size: '14sp'
             size_hint_y: None
             height: '22dp'
