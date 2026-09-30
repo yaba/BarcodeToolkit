@@ -1,55 +1,138 @@
 # main.py — TicketCode / Barcode Wallet — passo 2: Gerador (PoC parque)
+#
+# Arranque blindado: a UI abre sempre; qualquer erro é mostrado no ecra
+# (campo copiavel) e gravado em ficheiro legivel sem ferramentas extra.
 import os
-import platform
+import sys
 import traceback
 
 from kivy.app import App
 from kivy.lang import Builder
 from kivy.uix.screenmanager import ScreenManager, Screen
+from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.label import Label
+from kivy.uix.textinput import TextInput
+from kivy.uix.scrollview import ScrollView
 from kivy.core.window import Window
 from kivy.graphics.texture import Texture
 from kivy.clock import Clock
 from kivy.metrics import dp
 from kivy.base import ExceptionHandler, ExceptionManager
 
-from barcodegen import SYMBOLOGIES, time_code, render
+ANDROID = 'ANDROID_ARGUMENT' in os.environ  # True quando corre no telemovel
 
-ANDROID = 'ANDROID_ARGUMENT' in os.environ  # True quando corre no telemóvel
-
-# no PC simular proporção de telemóvel; no Android deixar em fullscreen nativo
+# no PC simular proporcao de telemovel; no Android fullscreen nativo
 if not ANDROID:
     Window.size = (740, 360)
-Window.clearcolor = (0, 0, 0, 1)   # fundo preto
+Window.clearcolor = (0, 0, 0, 1)
+
+# python-barcode/PIL importados de forma PREGUICOSA (so quando se gera um
+# codigo). Se falharem no telemovel, a UI abre na mesma e o erro aparece
+# como texto, em vez de matar a app no arranque.
+_bg = {"SYMBOLOGIES": {
+    "Code128": "code128", "Code39": "code39", "ITF": "itf",
+    "EAN-13": "ean13", "EAN-8": "ean8", "UPC-A": "upca",
+    "GS1-128": "gs1_128", "Codabar": "codabar",
+}, "time_code": None, "render": None, "err": None}
 
 
-# --- rede de segurança: em vez de crash silencioso, mostra o traceback ---
+def _ensure_barcode():
+    """Importa barcodegen na primeira utilizacao. Devolve True se ok."""
+    if _bg["render"] is not None:
+        return True
+    if _bg["err"] is not None:
+        return False
+    try:
+        import barcodegen
+        _bg["SYMBOLOGIES"] = barcodegen.SYMBOLOGIES
+        _bg["time_code"] = barcodegen.time_code
+        _bg["render"] = barcodegen.render
+        return True
+    except Exception:
+        _bg["err"] = traceback.format_exc()
+        return False
+
+
+# ---------------- captura de erros ----------------
+def _crash_dir_candidates():
+    dirs = []
+    # 1) pasta externa da app (sem permissoes; visivel em gestores de ficheiros)
+    try:
+        from jnius import autoclass
+        PythonActivity = autoclass('org.kivy.android.PythonActivity')
+        act = PythonActivity.mActivity
+        d = act.getExternalFilesDir(None)
+        if d:
+            dirs.append(d.getAbsolutePath())
+    except Exception:
+        pass
+    # 2) armazenamento primario
+    dirs.append('/sdcard')
+    dirs.append('/sdcard/Download')
+    # 3) home (PC / fallback)
+    dirs.append(os.path.expanduser('~'))
+    return dirs
+
+
+def _write_crash(text):
+    for d in _crash_dir_candidates():
+        try:
+            path = os.path.join(d, 'btk_crash.txt')
+            with open(path, 'w') as f:
+                f.write(text)
+            return path
+        except Exception:
+            continue
+    return None
+
+
+def _show_error_root(tb_text, saved_path=None):
+    """Widget de erro copiavel para usar como root da app."""
+    root = BoxLayout(orientation='vertical', padding=dp(8), spacing=dp(6))
+    header = 'ERRO — copia este texto:'
+    if saved_path:
+        header += f'\n(gravado em: {saved_path})'
+    root.add_widget(Label(text=header, size_hint_y=None, height=dp(48),
+                          color=(1, 0.5, 0.5, 1), font_size='12sp'))
+    sv = ScrollView()
+    ti = TextInput(text=tb_text, readonly=True, font_size='11sp',
+                   background_color=(0.08, 0.08, 0.08, 1),
+                   foreground_color=(0.9, 0.9, 0.9, 1))
+    ti.size_hint_y = None
+    ti.height = max(dp(400), len(tb_text.splitlines()) * dp(16))
+    sv.add_widget(ti)
+    root.add_widget(sv)
+    return root
+
+
+def _report(tb_text):
+    path = _write_crash(tb_text)
+    try:
+        app = App.get_running_app()
+        if app is not None:
+            app.root = _show_error_root(tb_text, path)
+    except Exception:
+        pass
+    return path
+
+
+# excepthook global (apanha erros fora do loop do Kivy)
+def _excepthook(exc_type, exc, tb):
+    _write_crash(''.join(traceback.format_exception(exc_type, exc, tb)))
+    sys.__excepthook__(exc_type, exc, tb)
+
+
+sys.excepthook = _excepthook
+
+
 class _CrashHandler(ExceptionHandler):
     def handle_exception(self, inst):
-        tb = traceback.format_exc()
-        # gravar num ficheiro acessível
-        for path in ('/sdcard/barcodetoolkit_crash.txt',
-                     os.path.join(os.path.expanduser('~'), 'btk_crash.txt')):
-            try:
-                with open(path, 'w') as f:
-                    f.write(tb)
-                break
-            except Exception:
-                continue
-        # mostrar no ecrã
-        try:
-            app = App.get_running_app()
-            if app and app.root is not None:
-                app.root.clear_widgets()
-                app.root.add_widget(Label(
-                    text=tb[-3500:], color=(1, 1, 1, 1),
-                    font_size='11sp', halign='left', valign='top'))
-        except Exception:
-            pass
+        _report(traceback.format_exc())
         return ExceptionManager.PASS
 
 
 ExceptionManager.add_handler(_CrashHandler())
+
 
 KV = """
 #:set FG (0.88, 0.88, 0.88, 1)
@@ -97,7 +180,6 @@ KV = """
         padding: '6dp'
         spacing: '6dp'
 
-        # ---- barra de controlos (topo) ----
         BoxLayout:
             size_hint_y: None
             height: '32dp'
@@ -154,7 +236,6 @@ KV = """
                 id: manual_code
                 on_text_validate: root.draw()
 
-        # ---- código (ocupa todo o espaço livre) ----
         AnchorLayout:
             id: area
             Widget:
@@ -174,7 +255,6 @@ KV = """
                     fit_mode: 'fill'
                     center: holder.center
 
-        # ---- info ----
         Label:
             id: info
             color: FG
@@ -182,7 +262,6 @@ KV = """
             size_hint_y: None
             height: '22dp'
 
-        # ---- barra inferior (ações + navegação) ----
         BoxLayout:
             size_hint_y: None
             height: '40dp'
@@ -246,17 +325,16 @@ KV = """
 
 
 def pil_to_texture(img):
-    """PIL.Image -> Texture do Kivy (RGBA evita problemas de alinhamento GL)."""
     img = img.convert('RGBA')
     tex = Texture.create(size=img.size, colorfmt='rgba')
     tex.blit_buffer(img.tobytes(), colorfmt='rgba', bufferfmt='ubyte')
-    tex.flip_vertical()            # PIL tem origem em cima, GL em baixo
-    tex.mag_filter = 'nearest'     # barras nítidas se houver reescala
+    tex.flip_vertical()
+    tex.mag_filter = 'nearest'
     return tex
 
 
 class GeradorScreen(Screen):
-    symbologies = list(SYMBOLOGIES)
+    symbologies = list(_bg["SYMBOLOGIES"])
 
     def __init__(self, **kw):
         super().__init__(**kw)
@@ -265,9 +343,12 @@ class GeradorScreen(Screen):
         self.job = None
 
     def on_kv_post(self, base_widget):
-        # ids só existem depois de aplicada a regra KV
-        self.ids.area.bind(size=lambda *a: self.fit_image())
-        Clock.schedule_once(lambda dt: self.draw())
+        try:
+            self.ids.area.bind(size=lambda *a: self.fit_image())
+        except Exception:
+            _report(traceback.format_exc())
+        # NAO geramos automaticamente: a UI abre limpa; o utilizador prime Gerar
+        self.ids.info.text = 'Prime "Gerar"'
 
     def set_zoom(self, factor):
         self.zoom = min(6.0, max(0.4, self.zoom * factor))
@@ -276,24 +357,32 @@ class GeradorScreen(Screen):
     def payload(self):
         if self.ids.manual.active:
             return self.ids.manual_code.text.strip(), None
-        return time_code(float(self.ids.offset.text or 0), self.ids.term.text or 0)
+        return _bg["time_code"](float(self.ids.offset.text or 0),
+                                self.ids.term.text or 0)
 
     def draw(self):
         info = self.ids.info
+        if not _ensure_barcode():
+            # import do barcode/PIL falhou -> mostrar o motivo real
+            info.text = 'erro no import (ver btk_crash.txt)'
+            _report(_bg["err"] or 'import falhou')
+            return
         try:
             code, t = self.payload()
             if not code:
-                info.text = '(código vazio)'
+                info.text = '(codigo vazio)'
                 return
-            self.ids.code_img.texture = pil_to_texture(render(code, self.ids.sym.text, self.zoom))
+            img = _bg["render"](code, self.ids.sym.text, self.zoom)
+            self.ids.code_img.texture = pil_to_texture(img)
             self.fit_image()
             stamp = f'   {t:%d-%m-%Y %H:%M:%S}' if t else '   [manual]'
             info.text = f'{code}{stamp}'
-        except Exception as e:
-            info.text = f'erro: {e}'
+        except Exception:
+            tb = traceback.format_exc()
+            info.text = 'erro ao gerar (ver btk_crash.txt)'
+            _write_crash(tb)
 
     def fit_image(self):
-        """Tamanho nativo da textura; só encolhe se não couber na área."""
         img, area = self.ids.code_img, self.ids.area
         if not img.texture:
             return
@@ -330,12 +419,21 @@ class CarteiraScreen(Screen):
 class TicketCodeApp(App):
     def build(self):
         self.title = 'TicketCode / Barcode Wallet'
-        Builder.load_string(KV)          # regras de classe (<GeradorScreen> etc.)
-        sm = ScreenManager()
-        sm.add_widget(GeradorScreen())   # instanciados em código, não via regra raiz
-        sm.add_widget(CarteiraScreen())
-        return sm
+        try:
+            Builder.load_string(KV)
+            sm = ScreenManager()
+            sm.add_widget(GeradorScreen())
+            sm.add_widget(CarteiraScreen())
+            return sm
+        except Exception:
+            tb = traceback.format_exc()
+            path = _write_crash(tb)
+            return _show_error_root(tb, path)
 
 
 if __name__ == '__main__':
-    TicketCodeApp().run()
+    try:
+        TicketCodeApp().run()
+    except Exception:
+        _write_crash(traceback.format_exc())
+        raise
